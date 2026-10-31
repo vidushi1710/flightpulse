@@ -41,3 +41,5 @@ ml-service-python/data/
 .DS_Store
 .vscode/
 *.swp
+# Generated machine learning model
+*.pkl
