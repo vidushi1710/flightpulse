@@ -209,8 +209,7 @@ def build_model(numeric_features, categorical_features):
 
     classifier = SGDClassifier(
         loss="log_loss",
-        class_weight="balanced",
-        max_iter=10,
+            max_iter=10,
         tol=0.001,
         random_state=RANDOM_STATE,
     )

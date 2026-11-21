@@ -48,3 +48,7 @@ ml-service-python/data/
 !.mvn/wrapper/
 !mvnw
 !mvnw.cmd
+
+.env
+*/.env
+**/.env

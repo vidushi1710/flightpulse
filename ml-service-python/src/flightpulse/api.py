@@ -1,4 +1,3 @@
-
 import json
 from pathlib import Path
 from datetime import datetime
@@ -14,53 +13,45 @@ from pydantic import BaseModel, Field
 from src.flightpulse.aviationstack import fetch_live_flights
 
 
-# =========================================================
-# 1. PATHS AND MODEL
-# =========================================================
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-MODEL_FILE = PROJECT_ROOT / "models" / "flight_delay_model.pkl"
-THRESHOLD_FILE = PROJECT_ROOT / "models" / "threshold.json"
+MODEL_FILE = PROJECT_ROOT / "models" / "flightpulse_lightgbm.pkl"
 ROUTE_FILE = PROJECT_ROOT / "data" / "processed" / "route_distances.json"
 
-for file_path in [MODEL_FILE, THRESHOLD_FILE, ROUTE_FILE]:
+for file_path in [MODEL_FILE, ROUTE_FILE]:
     if not file_path.exists():
         raise FileNotFoundError(f"Required file not found: {file_path}")
 
 model = joblib.load(MODEL_FILE)
 
-with open(THRESHOLD_FILE, "r") as file:
-    threshold_config = json.load(file)
-
 with open(ROUTE_FILE, "r") as file:
     ROUTE_DISTANCES = json.load(file)
 
-CLASSIFICATION_THRESHOLD = float(
-    threshold_config["classification_threshold"]
-)
+CLASSIFICATION_THRESHOLD = 0.14
 
-preprocessing = model.named_steps["preprocessing"]
-encoder = preprocessing.named_transformers_["categorical"]
+FEATURES = [
+    "MONTH", "DAY_OF_WEEK", "DEP_HOUR", "ARR_HOUR",
+    "DISTANCE", "AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT"
+]
 
-AIRLINE_CODES = set(encoder.categories_[0].tolist())
-AIRPORT_CODES = set(encoder.categories_[1].tolist())
+CAT_COLS = ["AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]
 
+# Recover the categorical levels stored with the trained LightGBM model.
+CATEGORY_LEVELS = getattr(model.booster_, "pandas_categorical", None)
 
-# =========================================================
-# 2. FASTAPI APPLICATION
-# =========================================================
+if CATEGORY_LEVELS is None:
+    raise RuntimeError("LightGBM categorical metadata is missing.")
+
+AIRLINE_CODES = set(str(x) for x in CATEGORY_LEVELS[0])
+AIRPORT_CODES = set(str(x) for x in CATEGORY_LEVELS[1])
+
 
 app = FastAPI(
     title="FlightPulse API",
-    description="Experimental flight delay risk prediction service.",
-    version="1.4.0",
+    description="Experimental flight delay risk prediction service using historical ML and live flight data.",
+    version="2.0.0",
 )
 
-
-# =========================================================
-# 3. INPUT SCHEMA
-# =========================================================
 
 class FlightInput(BaseModel):
     MONTH: int = Field(ge=1, le=12)
@@ -73,12 +64,20 @@ class FlightInput(BaseModel):
     DESTINATION_AIRPORT: str = Field(min_length=1)
 
 
-# =========================================================
-# 4. PREDICTION ENGINE
-# =========================================================
+def prepare_features(features):
+    data = pd.DataFrame([features], columns=FEATURES)
+
+    for i, col in enumerate(CAT_COLS):
+        data[col] = pd.Categorical(
+            data[col].astype(str),
+            categories=CATEGORY_LEVELS[i]
+        )
+
+    return data
+
 
 def predict_features(features):
-    data = pd.DataFrame([features])
+    data = prepare_features(features)
 
     probability = float(model.predict_proba(data)[0][1])
     prediction = int(probability >= CLASSIFICATION_THRESHOLD)
@@ -89,36 +88,23 @@ def predict_features(features):
         "prediction": prediction,
         "risk_level": "High" if prediction else "Low",
         "classification_threshold": CLASSIFICATION_THRESHOLD,
+        "model": "LightGBM",
         "model_period": "2015 historical training data",
         "experimental_estimate": True,
     }
 
 
-# =========================================================
-# 5. TIMEZONE CONVERSION
-# =========================================================
-
 def local_scheduled_time(timestamp, timezone):
     if not timestamp or not timezone:
-        raise ValueError(
-            "Scheduled timestamp or airport timezone is missing."
-        )
+        raise ValueError("Scheduled timestamp or airport timezone is missing.")
 
-    parsed = datetime.fromisoformat(
-        timestamp.replace("Z", "+00:00")
-    )
+    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 
     if parsed.tzinfo is None:
-        raise ValueError(
-            "Scheduled timestamp has no timezone information."
-        )
+        raise ValueError("Scheduled timestamp has no timezone information.")
 
     return parsed.astimezone(ZoneInfo(timezone))
 
-
-# =========================================================
-# 6. REMOVE DUPLICATE CODESHARE LISTINGS
-# =========================================================
 
 def deduplicate_live_flights(flights):
     unique_flights = []
@@ -128,7 +114,6 @@ def deduplicate_live_flights(flights):
         flight_info = flight.get("flight") or {}
         departure = flight.get("departure") or {}
         arrival = flight.get("arrival") or {}
-
         codeshared = flight_info.get("codeshared") or {}
 
         operating_flight = (
@@ -158,16 +143,11 @@ def deduplicate_live_flights(flights):
     return unique_flights
 
 
-# =========================================================
-# 7. NORMALIZE AND PREDICT LIVE FLIGHTS
-# =========================================================
-
 def normalize_live_flight(flight):
     departure = flight.get("departure") or {}
     arrival = flight.get("arrival") or {}
     airline = flight.get("airline") or {}
     flight_info = flight.get("flight") or {}
-
     codeshared = flight_info.get("codeshared") or {}
 
     airline_code = (
@@ -182,28 +162,26 @@ def normalize_live_flight(flight):
     flight_number = (
         codeshared.get("flight_iata")
         or flight_info.get("iata")
+        or flight_info.get("number")
     )
 
     missing = []
 
     if airline_code not in AIRLINE_CODES:
-        missing.append(
-            f"Unsupported operating airline: {airline_code or 'missing'}"
-        )
+        missing.append(f"Unsupported airline: {airline_code or 'missing'}")
 
     if origin not in AIRPORT_CODES:
-        missing.append(
-            f"Unsupported origin airport: {origin or 'missing'}"
-        )
+        missing.append(f"Unsupported origin airport: {origin or 'missing'}")
 
     if destination not in AIRPORT_CODES:
-        missing.append(
-            f"Unsupported destination airport: {destination or 'missing'}"
-        )
+        missing.append(f"Unsupported destination airport: {destination or 'missing'}")
 
     if missing:
         return {
             "flight_number": flight_number,
+            "airline": airline_code,
+            "origin": origin,
+            "destination": destination,
             "status": "not_supported",
             "reasons": missing,
         }
@@ -218,9 +196,7 @@ def normalize_live_flight(flight):
             "origin": origin,
             "destination": destination,
             "status": "distance_unavailable",
-            "reasons": [
-                "No verified historical route distance found."
-            ],
+            "reasons": ["No verified historical route distance found."],
         }
 
     try:
@@ -267,10 +243,6 @@ def normalize_live_flight(flight):
     }
 
 
-# =========================================================
-# 8. ROOT ENDPOINT
-# =========================================================
-
 @app.get("/")
 def root():
     return {
@@ -280,15 +252,12 @@ def root():
     }
 
 
-# =========================================================
-# 9. HEALTH CHECK
-# =========================================================
-
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
         "model_loaded": True,
+        "model_name": "LightGBM",
         "classification_threshold": CLASSIFICATION_THRESHOLD,
         "supported_airlines": len(AIRLINE_CODES),
         "supported_airports": len(AIRPORT_CODES),
@@ -296,56 +265,27 @@ def health_check():
     }
 
 
-# =========================================================
-# 10. MANUAL PREDICTION
-# =========================================================
-
 @app.post("/predict")
 def predict_flight(flight: FlightInput):
     if flight.AIRLINE not in AIRLINE_CODES:
-        raise HTTPException(
-            status_code=422,
-            detail="Unsupported airline code."
-        )
+        raise HTTPException(status_code=422, detail="Unsupported airline code.")
 
     if flight.ORIGIN_AIRPORT not in AIRPORT_CODES:
-        raise HTTPException(
-            status_code=422,
-            detail="Unsupported origin airport."
-        )
+        raise HTTPException(status_code=422, detail="Unsupported origin airport.")
 
     if flight.DESTINATION_AIRPORT not in AIRPORT_CODES:
-        raise HTTPException(
-            status_code=422,
-            detail="Unsupported destination airport."
-        )
+        raise HTTPException(status_code=422, detail="Unsupported destination airport.")
 
     return predict_features(flight.model_dump())
 
 
-# =========================================================
-# 11. LIVE FLIGHTS ENDPOINT
-# =========================================================
-
 @app.get("/live-flights")
 def live_flights(
-    departure_airport: str = Query(
-        default="JFK",
-        min_length=3,
-        max_length=3
-    ),
-    limit: int = Query(
-        default=10,
-        ge=1,
-        le=100
-    ),
+    departure_airport: str = Query(default="JFK", min_length=3, max_length=3),
+    limit: int = Query(default=10, ge=1, le=100),
 ):
     try:
-        flights = fetch_live_flights(
-            departure_airport,
-            limit
-        )
-
+        flights = fetch_live_flights(departure_airport, limit)
         unique_flights = deduplicate_live_flights(flights)
 
         results = [
@@ -354,12 +294,12 @@ def live_flights(
         ]
 
         predicted_count = sum(
-            1 for flight in results
-            if flight["status"] == "predicted"
+            1 for flight in results if flight["status"] == "predicted"
         )
 
         return {
             "source": "Aviationstack",
+            "model": "LightGBM",
             "departure_airport": departure_airport.upper(),
             "total_flights_received": len(flights),
             "unique_flights": len(unique_flights),
@@ -367,9 +307,8 @@ def live_flights(
             "predicted_flights": predicted_count,
             "flights": results,
             "note": (
-                "Predictions use a model trained on 2015 "
-                "historical data. They are experimental estimates, "
-                "not guaranteed live forecasts."
+                "Predictions use a model trained on 2015 historical data. "
+                "These are experimental estimates, not guaranteed live forecasts."
             ),
         }
 
@@ -380,7 +319,4 @@ def live_flights(
         )
 
     except RuntimeError as error:
-        raise HTTPException(
-            status_code=502,
-            detail=str(error)
-        )
+        raise HTTPException(status_code=502, detail=str(error))
